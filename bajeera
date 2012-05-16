@@ -190,7 +190,7 @@ jira_start_session() {
 }
 
 jira_my_issues() {
-    do_rest "$CURL -X GET -H \"Content-Type: application/json\" \"${jira_url}rest/api/2/search?jql=assignee=andrewi\""
+    do_rest "$CURL -X GET -H \"Content-Type: application/json\" \"${jira_url}rest/api/2/search?jql=assignee=$jira_login\""
     #echo "$JSON_DATA"
     local total=$(json_get_value "total")
     echo "total $total"
