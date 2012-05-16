@@ -1,0 +1,10 @@
+;example configuration file
+
+[auth]
+;hook=`command to run in case everything else fails`
+
+[jira]
+url=http://jira.example.com/
+;jira login
+login    = user
+password = password
