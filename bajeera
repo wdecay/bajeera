@@ -1,0 +1,237 @@
+#!/bin/bash
+
+CONFIG=~/.jira
+COOKIES=~/.jira_cookies
+CURL="curl -s -b $COOKIES -c $COOKIES"
+
+# JSON recursive descent parser
+
+# JSON BNF Grammar
+# (as a simplification, <string> is the only terminal symbol
+# since bash doesn't support floating-point numbers and boolean
+# data type anyway; real strings, however, will be quoted as opposed
+# to values like `true`, `false`, `null` and numbers)
+#
+# <json>     ::= <object> | <array>
+# <object>   ::= "{" <members>* "}"
+# <members>  ::= <pair> | <pair> "," <members>
+# <pair>     ::= <string> ":" <value>
+# <array>    ::= "[" <elements>* "]"
+# <elements> ::= <value> | <value> "," <elements>
+# <value>    ::= <string> | <json>
+# 
+
+declare _token
+
+if [ ${BASH_VERSINFO[0]} -ge 4 ]; then
+    # associative arrays are available
+    declare -A JSON_DATA
+fi
+
+next() {
+    read -r _token
+}
+
+accept() {
+    [[ "${_token:0:1}" == "$1" ]] && return 0
+}
+
+expect() {
+    accept $1 || return 1 #fatal "Invalid token $_token, expected $1"
+    next
+    return 0
+}
+
+parse_value() {
+    accept 's' && JSON_DATA[$1]=a && echo "\"$1\":${_token#s#}" && expect 's' || 
+    parse_json "$1"
+}
+
+parse_pair() {
+    local path="${_token#s#\"}"
+    path="${path%\"}"
+    #echo $path
+    [ -z "$1" ] || path="$1.$path"
+    expect 's' && expect ':' && parse_value "$path"
+}
+
+parse_members() {
+    parse_pair "$1"
+    local result=$?
+    if [ $result == 0 ]; then
+        accept ','
+        if [ $? -eq 0 ]; then
+            expect ','
+            parse_members "$1"
+            result=$?
+        fi
+    fi
+    return $result
+}
+
+parse_elements() {
+    declare -i index=$2
+    [[ -n "$index" ]] || $index=0
+    parse_value "$1[$index]"
+    local result=$?
+    if [ $result == 0 ]; then
+        (( index++ ))
+        accept ','
+        if [ $? -eq 0 ]; then
+            expect ','
+            parse_elements "$1" $index
+            result=$?
+        else
+            echo "\"$1[@]\":$index"
+        fi
+    fi
+    return $result
+}
+
+parse_array() {
+    expect '[' && accept ']' && echo "\"$1[@]\":0" || parse_elements "$1"
+    [[ $? -eq 0 ]] && expect ']'
+}
+
+parse_object() {
+    expect '{' && accept '}' || parse_members "$1"
+    [[ $? -eq 0 ]] && expect '}'
+}
+
+parse_json() {
+   accept '{' && parse_object "$1" || parse_array "$1"
+}
+
+parser() {
+    next
+    parse_json
+    local result=$?
+    # More stuff? Shouldn't be, but we'll go ahead and
+    # swallow it to avoid 'broken pipe' error
+    exec cat > /dev/null 2>&1
+    return $result
+}
+
+
+
+read_string() {
+    local _ifs=$IFS
+    IFS=$'\n'
+    while read -r -N 1 char
+    do
+        case $char in
+            \")
+                return;;
+            \\)
+                read -r -N 1 char;
+                echo -n "\\$char";
+                continue;;
+        esac
+        echo -n "$char"
+    done
+    IFS=_ifs
+}
+
+lexer() {
+    local val=
+    while read -r -N 1 char
+    do
+        case $char in
+            [{\}:,[\]])
+                if [ -n "$val" ]; then
+                    echo s#$val
+                    val=
+                fi
+                echo $char;;
+            \")
+                echo "s#\"$(read_string)\"";;
+            [^[:blank:]])
+                val="$val$char";;
+        esac
+    done
+}
+
+fatal() {
+    echo "Fatal error:" "$@" >&2
+    exit 1
+}
+
+json_get_value() {
+    local regex="^\"$@\":"
+    regex=${regex//[/\\[}
+#TODO: fix broken pipe here
+    value=$(echo "$JSON_DATA" | grep "$regex")
+    local result=$?
+    [ $result -eq 0 ] && echo $value | sed -e "s/$regex//"
+    return $result
+}
+
+do_rest() {
+    #echo "$@"
+    JSON_DATA=$(eval $@ | lexer | parser)    
+    #echo "$JSON_DATA"
+}
+
+try_auth_hook() {
+    eval $auth_hook
+}
+
+jira_login() {
+    do_rest "$CURL -H \"Content-Type: application/json\" -d '{\"username\" : \"$jira_login\", \"password\" : \"$jira_password\"}' \"${jira_url}rest/auth/latest/session\""
+    json_get_value "session.name" >/dev/null
+    #echo "$JSON_DATA"
+}
+
+
+jira_start_session() {
+    do_rest "$CURL \"${jira_url}rest/auth/latest/session\""
+    json_get_value "name" >/dev/null || { json_get_value "errorMessages[@]" >/dev/null && jira_login; } ||
+    { [ -z "$1" ] && try_auth_hook && jira_start_session 1; }
+}
+
+jira_my_issues() {
+    do_rest "$CURL -X GET -H \"Content-Type: application/json\" \"${jira_url}rest/api/2/search?jql=assignee=andrewi\""
+    #echo "$JSON_DATA"
+    local total=$(json_get_value "total")
+    echo "total $total"
+    for (( i=0; i<total; i++ ))
+    do
+
+        local key=$(json_get_value "issues[$i].key")
+        local desc=$(json_get_value "issues[$i].fields.summary")
+            #eval echo -e $key"\\\\t"$desc
+        eval "printf '%-10s %s\n' $key $desc"
+        #eval echo $key $desc
+    done
+}
+
+# loading settings from the config file
+if [ -f $CONFIG ]; then
+    lineno=0
+    while read line; do
+        (( lineno++ ))
+        line=${line##;*}
+        if [ -z "$line" ]; then :
+        elif [[ "$line" =~ \[(.*)\] ]]; then
+            section=${BASH_REMATCH[1]};
+        elif [[ "$line" =~ ([[:alpha:]][[:alnum:]]*)[[:blank:]]*=[[:blank:]]*(.*) ]]; then
+            if [ -n "$section" ]; then
+                vname=${section}_${BASH_REMATCH[1]}
+                vname=${vname,,}
+                eval $vname='${BASH_REMATCH[2]}'
+                #echo "$vname = ${!vname}"
+            else
+                fatal "Parameter outside a section in line #$lineno"
+            fi
+        else
+            fatal Unrecognized parameter in line \#$lineno.
+        fi
+    done < $CONFIG
+fi
+
+jira_start_session
+[ $? -eq 0 ] || fatal "Unable to connect to Jira"
+
+jira_my_issues
+
+[ $? -eq 0 ] || echo "[failed]"
