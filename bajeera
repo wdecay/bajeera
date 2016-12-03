@@ -4,7 +4,7 @@ CONFIG=~/.jira
 COOKIES=~/.jira_cookies
 CURL="curl -s -b $COOKIES -c $COOKIES"
 
-# JSON recursive descent parser
+# JSON recursive descent parser :)
 
 # JSON BNF Grammar
 # (as a simplification, <string> is the only terminal symbol
